@@ -1,17 +1,17 @@
 <script setup>
 import { watch, onMounted, ref, onBeforeUnmount, computed } from "vue";
-import { useMessage } from 'naive-ui'
+import { useMessage, useThemeVars } from 'naive-ui'
 import { useScopedI18n } from '@/i18n/app'
 import { useGlobalState } from '../store'
 import { CloudDownloadRound, ArrowBackIosNewFilled, ArrowForwardIosFilled, InboxRound } from '@vicons/material'
 import { useIsMobile } from '../utils/composables'
 import { processItem } from '../utils/email-parser'
-import { utcToLocalDate } from '../utils';
 import { buildReplyModel, buildForwardModel } from '../utils/mail-actions'
 import MailContentRenderer from "./MailContentRenderer.vue";
-import AiExtractInfo from "./AiExtractInfo.vue";
+import MailSummary from "./MailSummary.vue";
 
 const message = useMessage()
+const themeVars = useThemeVars()
 const isMobile = useIsMobile()
 
 const props = defineProps({
@@ -68,7 +68,7 @@ const props = defineProps({
 const localFilterKeyword = ref('')
 
 const {
-  isDark, mailboxSplitSize, mailListView, mailListPreviewLineClamp, indexTab, loading, useUTCDate,
+  isDark, mailboxSplitSize, mailListView, mailListPreviewLineClamp, indexTab, loading,
   autoRefresh, configAutoRefreshInterval, sendMailModel
 } = useGlobalState()
 const autoRefreshInterval = ref(configAutoRefreshInterval.value)
@@ -145,8 +145,8 @@ const prevMail = async () => {
     openMail(data.value[currentIndex - 1])
   } else if (page.value > 1) {
     page.value--
-    await refresh()
-    if (data.value.length > 0) {
+    const refreshed = await refresh()
+    if (refreshed && data.value.length > 0) {
       openMail(data.value[data.value.length - 1])
     }
   }
@@ -160,8 +160,8 @@ const nextMail = async () => {
     openMail(data.value[currentIndex + 1])
   } else if (count.value > page.value * pageSize.value) {
     page.value++
-    await refresh()
-    if (data.value.length > 0) {
+    const refreshed = await refresh()
+    if (refreshed && data.value.length > 0) {
       openMail(data.value[0])
     }
   }
@@ -200,22 +200,28 @@ watch(autoRefresh, async (autoRefresh, old) => {
   setupAutoRefresh(autoRefresh)
 }, { immediate: true })
 
-watch([page, pageSize], async ([page, pageSize], [oldPage, oldPageSize]) => {
-  if (page !== oldPage || pageSize !== oldPageSize) {
+let loadedPage = { page: page.value, pageSize: pageSize.value }
+let requestedPage = null
+watch([page, pageSize], async ([page, pageSize]) => {
+  if (requestedPage?.page === page && requestedPage.pageSize === pageSize) return
+  if (loadedPage.page !== page || loadedPage.pageSize !== pageSize) {
     await refresh();
   }
 })
 
 const refresh = async () => {
+  const pagination = { page: page.value, pageSize: pageSize.value }
+  requestedPage = pagination
   try {
     const { results, count: totalCount } = await props.fetchMailData(
-      pageSize.value, (page.value - 1) * pageSize.value
+      pagination.pageSize, (pagination.page - 1) * pagination.pageSize
     );
     loading.value = true;
     rawData.value = await Promise.all(results.map(async (item) => {
       item.checked = false;
       return await processItem(item);
     }));
+    loadedPage = pagination
     if (totalCount > 0) {
       count.value = totalCount;
     }
@@ -223,10 +229,16 @@ const refresh = async () => {
     if (!isMobile.value && !mailListView.value && data.value.length > 0) {
       curMail.value = data.value[0];
     }
+    return true
   } catch (error) {
     message.error(error.message || "error");
     console.error(error);
+    if (requestedPage === pagination && page.value === pagination.page && pageSize.value === pagination.pageSize) {
+      page.value = loadedPage.page
+      pageSize.value = loadedPage.pageSize
+    }
   } finally {
+    if (requestedPage === pagination) requestedPage = null
     loading.value = false;
   }
 };
@@ -304,6 +316,7 @@ const multiActionSelectAll = (checked) => {
 }
 
 const multiActionDeleteMail = async () => {
+  const deletedIds = new Set()
   try {
     loading.value = true;
     const selectedMails = data.value.filter((item) => item.checked);
@@ -317,19 +330,22 @@ const multiActionDeleteMail = async () => {
     };
     for (const [index, mail] of selectedMails.entries()) {
       await props.deleteMail(mail.id);
-      showMultiActionDelete.value = true;
+      deletedIds.add(mail.id)
       multiActionDeleteProgress.value = {
         percentage: Math.floor((index + 1) / selectedMails.length * 100),
         tip: `${index + 1}/${selectedMails.length}`
       };
     }
+    showMultiActionDelete.value = true;
     message.success(t("success"));
     await refresh();
   } catch (error) {
+    rawData.value = rawData.value.filter(mail => !deletedIds.has(mail.id))
+    count.value = Math.max(0, count.value - deletedIds.size)
+    if (deletedIds.has(curMail.value?.id)) curMail.value = null
     message.error(error.message || "error");
   } finally {
     loading.value = false;
-    showMultiActionDelete.value = true;
   }
 }
 
@@ -425,34 +441,15 @@ onBeforeUnmount(() => {
           </div>
         </template>
         <template #1>
-          <div style="overflow: auto; min-height: 60vh; max-height: 100vh;">
+          <div class="mail-list-scroll mail-list-compact">
             <n-list hoverable clickable>
               <n-list-item v-for="row in data" v-bind:key="row.id" @click="() => clickRow(row)"
                 :class="[mailItemClass(row), { 'mail-list-unread': enableMailReadStatus && row.is_unread === 1 }]">
                 <template #prefix v-if="multiActionMode">
-                  <n-checkbox v-model:checked="row.checked" />
+                  <n-checkbox v-model:checked="row.checked" @click.stop />
                 </template>
-                <n-thing :title="row.subject">
-                  <template #description>
-                    <n-tag type="info">
-                      ID: {{ row.id }}
-                    </n-tag>
-                    <n-tag type="info">
-                      {{ utcToLocalDate(row.created_at, useUTCDate) }}
-                    </n-tag>
-                    <n-tag type="info">
-                      <n-ellipsis style="max-width: 240px;">
-                        {{ showEMailTo ? "FROM: " + row.source : row.source }}
-                      </n-ellipsis>
-                    </n-tag>
-                    <n-tag v-if="showEMailTo" type="info">
-                      <n-ellipsis style="max-width: 240px;">
-                        TO: {{ row.address }}
-                      </n-ellipsis>
-                    </n-tag>
-                    <AiExtractInfo :metadata="row.metadata" compact />
-                  </template>
-                </n-thing>
+                <MailSummary :mail="row" :showEMailTo="showEMailTo" :enableMailReadStatus="enableMailReadStatus"
+                  :previewLineClamp="mailListPreviewLineClampValue" />
               </n-list-item>
             </n-list>
           </div>
@@ -488,7 +485,7 @@ onBeforeUnmount(() => {
               </n-button>
             </n-flex>
           </div>
-          <n-card :bordered="false" embedded v-if="curMail" class="mail-item" :title="curMail.subject"
+          <n-card :bordered="false" v-if="curMail" class="mail-item" :title="curMail.subject"
             style="overflow: auto; max-height: 100vh;">
             <MailContentRenderer :mail="curMail" :showEMailTo="showEMailTo"
               :enableUserDeleteEmail="enableUserDeleteEmail" :showReply="showReply" :showSaveS3="showSaveS3"
@@ -504,51 +501,21 @@ onBeforeUnmount(() => {
           </n-card>
         </template>
       </n-split>
-      <div v-else class="mail-list-scroll">
+      <div v-else class="mail-list-scroll mail-list-compact">
         <n-list hoverable clickable>
           <n-list-item v-for="row in data" v-bind:key="row.id" @click="() => clickRow(row)"
             :class="[mailItemClass(row), { 'mail-list-unread': enableMailReadStatus && row.is_unread === 1 }]">
             <template #prefix v-if="multiActionMode">
-              <n-checkbox v-model:checked="row.checked" />
+              <n-checkbox v-model:checked="row.checked" @click.stop />
             </template>
-            <n-thing class="mail-list-thing">
-              <template #header>
-                <n-ellipsis class="mail-list-title">
-                  {{ row.subject }}
-                </n-ellipsis>
-              </template>
-              <template #description>
-                <div class="mail-list-meta">
-                  <n-tag type="info">
-                    ID: {{ row.id }}
-                  </n-tag>
-                  <n-tag type="info">
-                    {{ utcToLocalDate(row.created_at, useUTCDate) }}
-                  </n-tag>
-                  <n-tag type="info">
-                    <n-ellipsis class="mail-list-meta-text">
-                      {{ showEMailTo ? "FROM: " + row.source : row.source }}
-                    </n-ellipsis>
-                  </n-tag>
-                  <n-tag v-if="showEMailTo" type="info">
-                    <n-ellipsis class="mail-list-meta-text">
-                      TO: {{ row.address }}
-                    </n-ellipsis>
-                  </n-tag>
-                  <AiExtractInfo :metadata="row.metadata" compact />
-                </div>
-              </template>
-              <n-ellipsis v-if="row.text && mailListPreviewLineClampValue > 0"
-                :line-clamp="mailListPreviewLineClampValue" class="mail-list-preview" :tooltip="false">
-                {{ row.text }}
-              </n-ellipsis>
-            </n-thing>
+            <MailSummary :mail="row" :showEMailTo="showEMailTo" :enableMailReadStatus="enableMailReadStatus"
+              :previewLineClamp="mailListPreviewLineClampValue" />
           </n-list-item>
         </n-list>
       </div>
     </div>
     <div class="left" v-else>
-      <n-space justify="space-around" align="center" :wrap="false" style="display: flex; align-items: center;">
+      <n-space justify="space-between" align="center" :size="[8, 8]">
         <n-pagination v-model:page="page" v-model:page-size="pageSize" :item-count="count" simple size="small" />
         <n-switch v-model:value="autoRefresh" size="small" :round="false">
           <template #checked>
@@ -566,44 +533,25 @@ onBeforeUnmount(() => {
         <n-input v-model:value="localFilterKeyword"
           :placeholder="t('keywordQueryTip')" size="small" clearable />
       </div>
-      <div style="overflow: auto; min-height: 60vh; max-height: 100vh;">
+      <div class="mail-list-scroll mail-list-compact">
         <n-list hoverable clickable>
           <n-list-item v-for="row in data" v-bind:key="row.id" @click="() => clickRow(row)"
             :class="{ 'mail-list-unread': enableMailReadStatus && row.is_unread === 1 }">
-            <n-thing :title="row.subject">
-              <template #description>
-                <n-tag type="info">
-                  ID: {{ row.id }}
-                </n-tag>
-                <n-tag type="info">
-                  {{ utcToLocalDate(row.created_at, useUTCDate) }}
-                </n-tag>
-                <n-tag type="info">
-                  <n-ellipsis style="max-width: 240px;">
-                    {{ showEMailTo ? "FROM: " + row.source : row.source }}
-                  </n-ellipsis>
-                </n-tag>
-                <n-tag v-if="showEMailTo" type="info">
-                  <n-ellipsis style="max-width: 240px;">
-                    TO: {{ row.address }}
-                  </n-ellipsis>
-                </n-tag>
-                <AiExtractInfo :metadata="row.metadata" compact />
-              </template>
-            </n-thing>
+            <MailSummary :mail="row" :showEMailTo="showEMailTo" :enableMailReadStatus="enableMailReadStatus"
+              :previewLineClamp="mailListPreviewLineClampValue" />
           </n-list-item>
         </n-list>
       </div>
       <n-drawer v-model:show="curMail" width="100%" placement="bottom" :trap-focus="false" :block-scroll="false"
         style="height: 80vh;">
         <n-drawer-content :title="curMail ? curMail.subject : ''" closable>
-          <n-card :bordered="false" embedded style="overflow: auto;">
+          <div class="mail-mobile-reader">
             <MailContentRenderer :mail="curMail" :showEMailTo="showEMailTo"
               :enableUserDeleteEmail="enableUserDeleteEmail" :showReply="showReply" :showSaveS3="showSaveS3"
               :enableMailReadStatus="enableMailReadStatus" :onUpdateMailReadStatus="toggleCurrentMailUnread"
-              :useUTCDate="useUTCDate" :onDelete="deleteMail" :onReply="replyMail" :onForward="forwardMail"
+              :onDelete="deleteMail" :onReply="replyMail" :onForward="forwardMail"
               :onSaveToS3="saveToS3Proxy" />
-          </n-card>
+          </div>
         </n-drawer-content>
       </n-drawer>
     </div>
@@ -645,16 +593,24 @@ onBeforeUnmount(() => {
   z-index: 1000;
 }
 
-.overlay-dark-backgroud {
+.mail-list-compact :deep(.n-list-item.overlay-dark-backgroud) {
   background-color: rgba(255, 255, 255, 0.1);
 }
 
-.overlay-light-backgroud {
+.mail-list-compact :deep(.n-list-item.overlay-light-backgroud) {
   background-color: rgba(0, 0, 0, 0.1);
 }
 
 .mail-item {
   height: 100%;
+}
+
+:deep(.mail-item .n-card-header__main) {
+  overflow-wrap: anywhere;
+}
+
+.mail-mobile-reader {
+  min-width: 0;
 }
 
 .mail-list-scroll {
@@ -664,65 +620,17 @@ onBeforeUnmount(() => {
   max-height: 100vh;
 }
 
-.mail-list-thing,
-.mail-list-title,
-.mail-list-preview {
-  min-width: 0;
-  max-width: 100%;
+.mail-list-compact :deep(.n-list-item) {
+  height: auto;
+  padding: 12px 14px;
 }
 
-.mail-list-thing,
-.mail-list-preview {
-  width: 100%;
-}
-
-.mail-list-thing :deep(.n-thing-main),
-.mail-list-thing :deep(.n-thing-header),
-.mail-list-thing :deep(.n-thing-header__title),
-.mail-list-thing :deep(.n-thing-main__description),
-.mail-list-thing :deep(.n-thing-main__content) {
-  min-width: 0;
-}
-
-.mail-list-meta {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 4px;
-  min-width: 0;
-  max-width: 100%;
-}
-
-.mail-list-meta :deep(.n-tag) {
-  max-width: 100%;
-}
-
-.mail-list-meta-text {
-  max-width: min(240px, 100%);
-}
-
-.mail-list-preview {
-  display: -webkit-box;
-  overflow-wrap: anywhere;
-  opacity: 0.7;
+.mail-list-compact :deep(.n-list-item:not(.overlay):hover) {
+  background-color: v-bind("isDark ? 'rgba(255, 255, 255, 0.04)' : themeVars.hoverColor");
 }
 
 .mail-list-scroll :deep(.n-list-item__main) {
   min-width: 0;
-}
-
-.mail-list-unread :deep(.n-thing-header__title) {
-  font-weight: 700;
-}
-
-.mail-list-unread :deep(.n-thing-header__title)::before {
-  display: inline-block;
-  width: 7px;
-  height: 7px;
-  margin-right: 8px;
-  border-radius: 50%;
-  background: #2080f0;
-  content: '';
-  vertical-align: middle;
 }
 
 pre {
